@@ -1,0 +1,60 @@
+### KVO概念及实现原理
+Key-Value Obersver，即键值观察。它是观察者模式的一种具体实现。对目标对象的某个属性添加观察，当属性变化时，会自动通知观察者。这里的通知表现在触发观察者对象实现的KVO的接口。
+
+用法很简单，添加、接收通知、移除观察者：
+
+```
+// 添加
+- (void)addObserver:(NSObject *)observer forKeyPath:(NSString *)keyPath options:(NSKeyValueObservingOptions)options context:(nullable void *)context;
+
+// 接收通知
+- (void)observeValueForKeyPath:(nullable NSString *)keyPath ofObject:(nullable id)object change:(nullable NSDictionary<NSString*, id> *)change context:(nullable void *)context;
+
+// 移除观察者
+- (void)removeObserver:(NSObject *)observer forKeyPath:(NSString *)keyPath;
+```
+
+> KVO实现原理
+
+KVO的实现依赖于强大的runtime，具体实现的原理如下：
+1. 当观察对象A时，KVO机制动态创建一个新的名为：`NSKVONotifying_A `的新类，该类继承自对象A的本类。并且`被观察对象的isa指针也会指向新创建的NSKVONotifying_A类`，从而再次调用setter方法的时候就会调用新创建的`NSKVONotifying_A `类实现的setter方法了。
+2. KVO 为 `NSKVONotifying_A ` 重写观察属性的 setter 方法，新的setter 方法会负责在调用原 setter 方法之前和之后，通知所有观察对象属性值的更改情况。
+3. 被观察属性发生改变之前，willChangeValueForKey:被调用，通知系统该 keyPath 的属性值即将变更；当改变发生后， didChangeValueForKey: 被调用，通知系统该 keyPath 的属性值已经变更；之后， observeValueForKey:ofObject:change:context: 也会被调用。
+
+
+> KVO的缺陷以及如何自己实现KVO
+
+首先，系统提供的KVO的API本身就很不友好，不支持Block，代码聚合度底，需要至少在三个不同的地方编写KVO的相关方法；其次，如果你的父类也对你要观察的对象感兴趣，你也要做相关处理，系统提供了一个context的参数做相关处理，在 -addObserver:forKeyPath:options:context: 传进去一个父类不知道的 context，代码感觉很别扭。Facebook有开源一个库能解决上述问题[https://github.com/facebook/KVOController](https://github.com/facebook/KVOController)
+
+如果想要自己实现KVO，需要做的事大概是这些：
+1. 检查对象的类有没有相应的 setter 方法。如果没有抛出异常；
+2. 检查对象 isa 指向的类是不是一个 KVO 类。如果不是，新建一个继承原来类的子类，并把 isa 指向这个新建的子类；
+3. 检查对象的 KVO 类重写过没有这个 setter 方法。如果没有，添加重写的 setter 方法；
+4. 添加这个观察者
+
+具体实现参见[如何自己动手实现 KVO](http://tech.glowing.com/cn/implement-kvo/)
+
+### KVC概念及实现原理
+KVC（Key-value coding）键值编码。`它是一种不通过存取方法（setter、getter），而通过属性名称字符串间接访问属性的机制。`
+
+KVC常用的一些Api：
+
+```
+- (nullable id)valueForKey:(NSString *)key;                          //直接通过Key来取值
+- (void)setValue:(nullable id)value forKey:(NSString *)key;          //通过Key来设值
+- (nullable id)valueForKeyPath:(NSString *)keyPath;                  //通过KeyPath来取值
+- (void)setValue:(nullable id)value forKeyPath:(NSString *)keyPath;  //通过KeyPath来设值
+```
+
+那么KVC是如何实现访问属性的呢？当我们调用setValue：forKey：的时候，实际上是经历了这样几个步骤：
+
+1. 检查是否存在-<key>、-is<key>（只针对布尔值有效）或者-get<key>的访问器方法，如果有可能，就是用这些方法返回值；检查是否存在名为-set<key>:的方法，并使用它做设置值。对于-get<key>和-set<key>:方法，将大写Key字符串的第一个字母，并与Cocoa的方法命名保持一致；
+2. 如果上述方法不可用，则检查名为-_<key>、-_is<key>（只针对布尔值有效）、-_get<key>和-_set<key>:方法；
+3. 如果没有找到访问器方法，可以尝试直接访问实例变量。实例变量可以是名为：<key>或_<key>;
+4. 如果仍未找到，则调用valueForUndefinedKey:和setValue:forUndefinedKey:方法。这些方法的默认实现都是抛出异常，我们可以根据需要重写它们。
+
+> KVC的应用
+
+由于KVC绕过了存取方法来访问属性，而系统封装的一些对象通过存取方法能访问的只有显式属性，不能访问私有属性，有了KVC就可以访问那些私有属性了。
+
+首先可以用runtime遍历出对象的所有属性，找出你想要改变的属性，直接调用KVO的方法就行了。比如UIPageControl默认是小圆点，而显式属性又没有提供一个UIImage的属性给我们使用，如果要改变样式，没有KVC的话我们只能重新封装一个自定义的UIPageControl，有了KVC，我们可以先遍历出UIPageControl的所有属性，找到可能是设置样式的属性，用KVC设置就行了。
