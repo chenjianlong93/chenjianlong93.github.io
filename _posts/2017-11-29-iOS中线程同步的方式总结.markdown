@@ -1,0 +1,299 @@
+iOS保证线程同步的方式主要有以下几种：@synchronize、NSLock、dispatch_semaphore、NSCondition、NSConditionLock、pthread_mutex、OSSpinLock.本文主要记录一下它们的用法、实现机制、性能情况。
+
+### @synchronize
+看下面这个例子：
+
+```
+NSObject *obj = [[NSObject alloc] init];
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @synchronized(obj) {
+            NSLog(@"需要线程同步的操作1 开始");
+            sleep(3);
+            NSLog(@"需要线程同步的操作1 结束");
+        }
+    });
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        sleep(1);
+        @synchronized(obj) {
+            NSLog(@"需要线程同步的操作2");
+        }
+    });
+
+// 运行结果如下
+2016-06-29 20:48:35.747 SafeMultiThread[35945:580107] 需要线程同步的操作1 开始
+2016-06-29 20:48:38.748 SafeMultiThread[35945:580107] 需要线程同步的操作1 结束
+2016-06-29 20:48:38.749 SafeMultiThread[35945:580118] 需要线程同步的操作2
+```
+
+可以看出，@synchronize使用方法非常简单，只需要后面紧跟一个需要保证线程同步的OC对象即可。这样做是通过牺牲性能换来语法的简洁与可读性。`它实际上是把这个对象当做锁来使用。这是通过一个哈希表来实现的，OC 在底层使用了一个互斥锁的数组(你可以理解为锁池)，通过对对象去哈希值来得到对应的互斥锁。`
+
+更详细的实现原理请参考这篇：[@synchronized，这儿比你想知道的还要多](http://yulingtianxia.com/blog/2015/11/01/More-than-you-want-to-know-about-synchronized/)
+
+### dispatch_semaphore
+同样例子：
+
+```
+dispatch_semaphore_t signal = dispatch_semaphore_create(1);
+dispatch_time_t overTime = dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC);
+
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        dispatch_semaphore_wait(signal, overTime);
+            NSLog(@"需要线程同步的操作1 开始");
+            sleep(2);
+            NSLog(@"需要线程同步的操作1 结束");
+        dispatch_semaphore_signal(signal);
+    });
+    
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        sleep(1);
+        dispatch_semaphore_wait(signal, overTime);
+            NSLog(@"需要线程同步的操作2");
+        dispatch_semaphore_signal(signal);
+    });
+    
+上面代码的执行结果为：
+
+2016-06-29 20:47:52.324 SafeMultiThread[35945:579032] 需要线程同步的操作1 开始
+2016-06-29 20:47:55.325 SafeMultiThread[35945:579032] 需要线程同步的操作1 结束
+2016-06-29 20:47:55.326 SafeMultiThread[35945:579033] 需要线程同步的操作2
+
+如果把超时时间设置为<2s的时候，执行的结果就是：
+
+2016-06-30 18:53:24.049 SafeMultiThread[30834:434334] 需要线程同步的操作1 开始
+2016-06-30 18:53:25.554 SafeMultiThread[30834:434332] 需要线程同步的操作2
+2016-06-30 18:53:26.054 SafeMultiThread[30834:434334] 需要线程同步的操作1 结束
+```
+
+dispatch_semaphore是GCD用来线程同步的一种方式，总共有三个api。分别是：
+`dispatch_semaphore_create （创建信号量，传入的数值即为信号总量）`、
+`dispatch_semaphore_signal （发送信号，信号量加一）`、
+`dispatch_semaphore_wait （信号量减一，如果信号量仍然大于0则往下执行，否则阻塞当前线程等待timeout）`
+
+dispatch_semaphore 是信号量，当信号总量设置为1时可以当做锁来用。在没有等待情况出现时，它的性能比 pthread_mutex 还要高，但一旦有等待情况出现时，性能就会下降许多。相对于 OSSpinLock 来说，它的优势在于等待时不会消耗 CPU 资源。
+
+### NSLock
+
+```
+NSLock *lock = [[NSLock alloc] init];
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        //[lock lock];
+        [lock lockBeforeDate:[NSDate date]];
+            NSLog(@"需要线程同步的操作1 开始");
+            sleep(2);
+            NSLog(@"需要线程同步的操作1 结束");
+        [lock unlock];
+        
+});
+    
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        sleep(1);
+        if ([lock tryLock]) {//尝试获取锁，如果获取不到返回NO，不会阻塞该线程
+            NSLog(@"锁可用的操作");
+            [lock unlock];
+        }else{
+            NSLog(@"锁不可用的操作");
+        }
+        
+        NSDate *date = [[NSDate alloc] initWithTimeIntervalSinceNow:3];
+        if ([lock lockBeforeDate:date]) {//尝试在未来的3s内获取锁，并阻塞该线程，如果3s内获取不到恢复线程, 返回NO,不会阻塞该线程
+            NSLog(@"没有超时，获得锁");
+            [lock unlock];
+        }else{
+            NSLog(@"超时，没有获得锁");
+        }
+});
+
+上面代码的执行结果为：
+
+2016-06-29 20:45:08.864 SafeMultiThread[35911:575795] 需要线程同步的操作1 开始
+2016-06-29 20:45:09.869 SafeMultiThread[35911:575781] 锁不可用的操作
+2016-06-29 20:45:10.869 SafeMultiThread[35911:575795] 需要线程同步的操作1 结束
+2016-06-29 20:45:10.870 SafeMultiThread[35911:575781] 没有超时，获得锁
+```
+
+NSLock是Cocoa提供给我们最基本的锁对象，这也是我们经常所使用的，除lock和unlock方法外，NSLock还提供了tryLock和lockBeforeDate:两个方法，前一个方法会尝试加锁，如果锁不可用(已经被锁住)，刚并不会阻塞线程，并返回NO。lockBeforeDate:方法会在所指定Date之前尝试加锁，如果在指定时间之前都不能加锁，则返回NO。
+
+NSLock 只是在内部封装了一个 pthread_mutex，属性为 PTHREAD_MUTEX_ERRORCHECK，它会损失一定性能换来错误提示。
+
+这里使用宏定义的原因是，OC 内部还有其他几种锁，他们的 lock 方法都是一模一样，仅仅是内部 pthread_mutex 互斥锁的类型不同。通过宏定义，可以简化方法的定义。
+
+NSLock 比 pthread_mutex 略慢的原因在于它需要经过方法调用，同时由于缓存的存在，多次方法调用不会对性能产生太大的影响。
+
+### NSRecursiveLock递归锁
+
+```
+//NSLock *lock = [[NSLock alloc] init];
+NSRecursiveLock *lock = [[NSRecursiveLock alloc] init];
+    
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        
+        static void (^RecursiveMethod)(int);
+        
+        RecursiveMethod = ^(int value) {
+            
+            [lock lock];
+            if (value > 0) {
+                
+                NSLog(@"value = %d", value);
+                sleep(1);
+                RecursiveMethod(value - 1);
+            }
+            [lock unlock];
+        };
+        
+        RecursiveMethod(5);
+});
+
+如果用NSLock（导致死锁，阻塞当前线程，崩溃）：
+2016-06-30 19:08:06.393 SafeMultiThread[30928:449008] value = 5
+2016-06-30 19:08:07.399 SafeMultiThread[30928:449008] *** -[NSLock lock]: deadlock (<NSLock: 0x7fd811d28810> '(null)')
+2016-06-30 19:08:07.399 SafeMultiThread[30928:449008] *** Break on _NSLockError() to debug.
+
+换成NSRecursiveLock（正确执行）：
+2016-06-30 19:09:41.414 SafeMultiThread[30949:450684] value = 5
+2016-06-30 19:09:42.418 SafeMultiThread[30949:450684] value = 4
+2016-06-30 19:09:43.419 SafeMultiThread[30949:450684] value = 3
+2016-06-30 19:09:44.424 SafeMultiThread[30949:450684] value = 2
+2016-06-30 19:09:45.426 SafeMultiThread[30949:450684] value = 1
+
+```
+
+如果用NSLock，RecursiveMethod是递归调用的。所以每次进入这个block时，都会去加一次锁，而从第二次开始，由于锁已经被使用了且没有解锁，所以它需要等待锁被解除，这样就导致了死锁，线程被阻塞住了。
+
+NSRecursiveLock实际上定义的是一个递归锁，这个锁可以被同一线程多次请求，而不会引起死锁。这主要是用在循环或递归操作中。
+
+它可以允许同一线程多次加锁，而不会造成死锁。递归锁会跟踪它被lock的次数。每次成功的lock都必须平衡调用unlock操作。只有所有达到这种平衡，锁最后才能被释放，以供其它线程使用。
+
+也就是说NSRecursiveLock递归锁只需要满足最后加锁解锁一一对应就可以，不必要求每次加锁，下次加锁前必须解锁。
+
+递归锁也是通过 pthread_mutex_lock 函数来实现，在函数内部会判断锁的类型，如果显示是递归锁，就允许递归调用，仅仅将一个计数器加一，锁的释放过程也是同理。
+
+NSRecursiveLock 与 NSLock 的区别在于内部封装的 pthread_mutex_t 对象的类型不同，前者的类型为 PTHREAD_MUTEX_RECURSIVE。
+
+### NSConditionLock条件锁
+
+```
+NSMutableArray *products = [NSMutableArray array];
+    
+NSInteger HAS_DATA = 1;
+NSInteger NO_DATA = 0;
+    
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        while (1) {
+            [lock lockWhenCondition:NO_DATA];
+            [products addObject:[[NSObject alloc] init]];
+            NSLog(@"produce a product,总量:%zi",products.count);
+            [lock unlockWithCondition:HAS_DATA];
+            sleep(1);
+        }
+        
+});
+    
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        while (1) {
+            NSLog(@"wait for product");
+            [lock lockWhenCondition:HAS_DATA];
+            [products removeObjectAtIndex:0];
+            NSLog(@"custome a product");
+            [lock unlockWithCondition:NO_DATA];
+        }
+        
+});
+
+上面代码执行结果如下：
+
+2016-06-30 20:31:58.699 SafeMultiThread[31282:521698] wait for product
+2016-06-30 20:31:58.699 SafeMultiThread[31282:521708] produce a product,总量:1
+2016-06-30 20:31:58.700 SafeMultiThread[31282:521698] custome a product
+2016-06-30 20:31:58.700 SafeMultiThread[31282:521698] wait for product
+2016-06-30 20:31:59.705 SafeMultiThread[31282:521708] produce a product,总量:1
+2016-06-30 20:31:59.706 SafeMultiThread[31282:521698] custome a product
+2016-06-30 20:31:59.706 SafeMultiThread[31282:521698] wait for product
+2016-06-30 20:32:00.707 SafeMultiThread[31282:521708] produce a product,总量:1
+2016-06-30 20:32:00.708 SafeMultiThread[31282:521698] custome a product
+
+```
+
+当我们在使用多线程的时候，有时一把只会lock和unlock的锁未必就能完全满足我们的使用。因为普通的锁只能关心锁与不锁，而不在乎用什么钥匙才能开锁，而我们在处理资源共享的时候，多数情况是只有满足一定条件的情况下才能打开这把锁。
+
+NSConditionLock 借助 NSCondition 来实现，它的本质就是一个生产者-消费者模型。“条件被满足”可以理解为生产者提供了新的内容。
+
+它的 lockWhenCondition 方法其实就是消费者方法，对应的 unlockWhenCondition 方法则是生产者，使用了 broadcast 方法通知了所有的消费者。
+
+### pthread_mutex
+
+```
+__block pthread_mutex_t theLock;
+    pthread_mutex_init(&theLock, NULL);
+    
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            pthread_mutex_lock(&theLock);
+            NSLog(@"需要线程同步的操作1 开始");
+            sleep(3);
+            NSLog(@"需要线程同步的操作1 结束");
+            pthread_mutex_unlock(&theLock);
+        
+});
+    
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            sleep(1);
+            pthread_mutex_lock(&theLock);
+            NSLog(@"需要线程同步的操作2");
+            pthread_mutex_unlock(&theLock);
+        
+});
+
+代码执行操作结果如下：
+
+2016-06-30 21:13:32.440 SafeMultiThread[31429:548869] 需要线程同步的操作1 开始
+2016-06-30 21:13:35.445 SafeMultiThread[31429:548869] 需要线程同步的操作1 结束
+2016-06-30 21:13:35.446 SafeMultiThread[31429:548866] 需要线程同步的操作2
+```
+pthread_mutex 是c语言定义下多线程加锁方式。
+
+1. pthread_mutex_init(pthread_mutex_t * mutex,const pthread_mutexattr_t attr);初始化锁变量mutex。attr为锁属性，NULL值为默认属性。
+2. pthread_mutex_lock(pthread_mutex_t* mutex);加锁
+3. pthread_mutex_tylock(pthread_mutex_t* mutex);加锁，但是与2不一样的是当锁已经在使用的时候，返回为EBUSY，而不是挂起等待。
+4. pthread_mutex_unlock(pthread_mutex_t* mutex);释放锁
+5. pthread_mutex_destroy(pthread_mutex_t* *mutex);使用完后释放
+
+除此之外还有pthread_mutex(recursive)，这是pthread_mutex为了防止在递归的情况下出现死锁而出现的递归锁。作用和NSRecursiveLock递归锁类似。
+
+### OSSpinLock
+
+```
+__block OSSpinLock theLock = OS_SPINLOCK_INIT;
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    OSSpinLockLock(&theLock);
+    NSLog(@"需要线程同步的操作1 开始");
+    sleep(3);
+    NSLog(@"需要线程同步的操作1 结束");
+    OSSpinLockUnlock(&theLock);
+    
+});
+
+dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    OSSpinLockLock(&theLock);
+    sleep(1);
+    NSLog(@"需要线程同步的操作2");
+    OSSpinLockUnlock(&theLock);
+    
+});
+
+```
+
+OSSpinLock 自旋锁，性能最高的锁。原理很简单，就是一直 do while 忙等。它的缺点是当等待时会消耗大量 CPU 资源，所以它不适用于较长时间的任务。
+
+YYKit作者也写过一篇文章[不再安全的 OSSpinLock](https://blog.ibireme.com/2016/01/16/spinlock_is_unsafe_in_ios/)，当中提到不安全的原因。
+
+原因主要是，当优先级较低的线程先取到锁和共享资源时，此时一个高优先级的线程正好访问此共享资源尝试获得这个锁，这时它会出于spin lock忙等状态，占用大量cpu，而低优先级线程无法和处于忙等的高优先级线程竞争cpu时间，从而导致任务迟迟完成不了，无法释放lock。
+
+最后贴一张各种锁的性能的图，图片来自[不再安全的 OSSpinLock](https://blog.ibireme.com/2016/01/16/spinlock_is_unsafe_in_ios/)
+
+![](https://blog.ibireme.com/wp-content/uploads/2016/01/lock_benchmark.png)
+
+鉴于OSSpinLock的不安全，所以我们在开发中如果考虑性能的话，建议使用dispatch_semaphore或者pthread_mutex。
+
+如果不考虑性能只要求方便的话可以直接使用@synchronize。
